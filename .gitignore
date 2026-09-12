@@ -1,0 +1,24 @@
+# Scala and SBT
+target/
+project/target/
+project/project/
+*.class
+*.jar
+
+# Build servers and IDEs
+.bloop/
+.bsp/
+.metals/
+.idea/
+.vscode/
+
+# Generated output
+*.log
+*.vcd
+*.fst
+
+# Editor and operating-system files
+*.swp
+*.swo
+*~
+.DS_Store
