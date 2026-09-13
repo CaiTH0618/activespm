@@ -4,20 +4,33 @@ ActiveSPM is a Chipyard generator for a software-controlled DMA engine with a
 globally addressable scratchpad memory. The generator is intended to be used by
 the customized NPU subsystem in Chipyard.
 
-This repository currently contains an elaboratable Scala interface framework,
-a functional banked scratchpad, a functional DMA datapath, and a polling MMIO
-control block. Software or a hardware master can configure and launch one DMA
-transfer at a time through the 64-bit register interface.
+The current implementation provides a shared banked scratchpad, a bidirectional
+byte-accurate DMA datapath, a polling MMIO control block, multi-instance
+Chipyard integration, and a dual-Rocket/dual-Gemmini mesh test configuration.
+Software can launch one DMA transfer at a time through the 64-bit register
+interface. Transfers support arbitrary byte alignment and length between the
+local scratchpad and configured external physical-memory ranges.
+
+The initial design uses one outstanding transaction on each DMA TileLink
+interface and has no interrupt, descriptor queue, address translation, ECC, or
+hardware buffer-ownership tracking.
 
 ## Directory Layout
 
-- `src/main/scala/activespm`: Parameters, interfaces, module shells, and system
-  integration.
+- `src/main/scala/activespm`: Parameters, interfaces, functional modules, and
+  system integration.
 - `src/test/scala/activespm`: Scala hardware tests.
+- `docs`: Architecture, configuration, interface, software, and verification
+  documentation.
 - `software/include`: The software-visible polling MMIO interface.
 - `software/tests`: C tests and their standalone bare-metal build.
-- `software/examples`: C example programs.
-- `scripts`: Integration-artifact checks.
+
+## Documentation
+
+Start with [`docs/index.md`](docs/index.md) for the complete documentation
+index. The documentation describes the system architecture, generator
+parameters, Chipyard and NoC integration, scratchpad organization, DMA and MMIO
+semantics, software synchronization, error handling, and verification flows.
 
 ## Building
 
@@ -25,7 +38,7 @@ ActiveSPM is built as a subproject of its parent Chipyard repository. From the
 Chipyard root, enter the configured environment and compile the project with:
 
 ```sh
-source env.sh
+source env.sh && source scripts/chipyard-build-resources.sh
 sbt "activespm/test" "chipyard/compile"
 ```
 
@@ -49,12 +62,17 @@ The Core and Gemmini in a row share a router. Each ActiveSPM and each L2 bank
 has a dedicated router. An ActiveSPM DMA ingress and its aggregated scratchpad
 egress are colocated; the control manager remains on CBus.
 
-## Interfaces
+## Architecture and Interfaces
 
 Each instance exposes three TileLink interfaces: a 64-bit MMIO control manager,
 an aggregated scratchpad data manager, and an external-memory DMA client. The
 DMA also has a private TileLink client connected to the scratchpad's internal
 manager; that path does not leave the instance.
+
+The control manager attaches to CBus. The aggregated scratchpad manager and
+external DMA client attach to SBus; on a Constellation NoC they use the stable
+names `activespm-spad[i]` and `activespm-dma[i]`. The DMA-local path remains
+inside the instance and does not consume a global NoC endpoint.
 
 The global and DMA-local scratchpad paths share one set of `TLRAM` banks through
 a round-robin TileLink crossbar. `spadBeatBytes` defines the scratchpad's native
@@ -102,11 +120,21 @@ flight, and return the acknowledged contiguous destination prefix through
 `bytesCompleted`. A zero-length request succeeds without issuing TileLink
 traffic.
 
+The DMA uses external physical addresses directly and contains no TLB or IOMMU.
+Software must synchronize buffer ownership between CPUs, Gemmini, and the
+ActiveSPM DMA with completion checks and RISC-V memory fences. The external DMA
+client is connected through coherent SBus, so the supplied configurations do
+not require a software-managed L2 flush for normal cacheable-memory transfers.
+
 Hardware tests exercise the DMA both directly and through the complete MMIO
 control path, including unaligned transfers, negotiated width differences,
 descriptor failures, sticky status, and TileLink response errors.
 
-## Bare-metal integration test
+Detailed interface and software requirements are documented in
+[`docs/dma-control.md`](docs/dma-control.md) and
+[`docs/software-guide.md`](docs/software-guide.md).
+
+## Bare-Metal Integration Test
 
 `software/include/activespm.h` exposes the stable 64-bit polling ABI without
 hiding hardware status or error codes. `activespm_start` writes a complete
@@ -120,7 +148,7 @@ by elaborating the matching SoC config; it does not add ActiveSPM sources to the
 Gemmini build. Build and run it from the Chipyard root with:
 
 ```sh
-source env.sh
+source env.sh && source scripts/chipyard-build-resources.sh
 make -C sims/verilator CONFIG=ActiveSPMDualGemminiMeshRocketConfig firrtl
 make -C generators/activespm/software/tests
 make -C sims/verilator CONFIG=ActiveSPMDualGemminiMeshRocketConfig \
