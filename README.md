@@ -4,9 +4,9 @@ ActiveSPM is a Chipyard generator for a software-controlled DMA engine with a
 globally addressable scratchpad memory. The generator is intended to be used by
 the customized NPU subsystem in Chipyard.
 
-This repository currently contains an elaboratable Scala interface scaffold.
-It does not yet implement DMA transfers, scratchpad storage, or functional MMIO
-register behavior.
+This repository currently contains an elaboratable Scala interface scaffold and
+a functional banked scratchpad. It does not yet implement DMA transfers or
+functional MMIO register behavior.
 
 ## Directory Layout
 
@@ -26,8 +26,10 @@ source env.sh
 sbt "activespm/test" "chipyard/compile"
 ```
 
-`chipyard.ActiveSPMScaffoldRocketConfig` is provided only to verify subsystem
-elaboration. It must not be used to run software or to access the scratchpad.
+`chipyard.ActiveSPMScaffoldRocketConfig` verifies the same-width subsystem
+attachment. `chipyard.ActiveSPMWideSBusScaffoldRocketConfig` verifies a 16-byte
+SBus attached to the scratchpad's 8-byte native interface. Both remain scaffold
+configurations and must not be used as functional DMA/software configurations.
 
 ## Interfaces
 
@@ -36,14 +38,26 @@ an aggregated scratchpad data manager, and an external-memory DMA client. The
 DMA also has a private TileLink client connected to the scratchpad's internal
 manager; that path does not leave the instance.
 
+The global and DMA-local scratchpad paths share one set of `TLRAM` banks through
+a round-robin TileLink crossbar. `spadBeatBytes` defines the scratchpad's native
+TileLink width, each bank's word width, and the bank-interleaving granularity.
+For a local byte offset, the bank is
+`(localOffset / spadBeatBytes) % nBanks`. The SBus width is negotiated and
+adapted independently, so it does not need to equal `spadBeatBytes`.
+
+The scratchpad supports `Get`, `PutFullData`, and `PutPartialData`. Partial
+writes preserve all unselected bytes, and global and local accesses observe the
+same storage. Different banks can operate concurrently; accesses to the same
+bank are fairly arbitrated. RAM contents are unspecified after reset.
+
 The control block submits one command at a time through a Decoupled request
 channel. DMA completion also uses a Decoupled channel so the result remains
 stable until accepted. Live busy and byte-count progress are reported
 separately without a handshake.
 
-At this scaffold stage the MMIO fields read as zero and ignore writes, the DMA
-clients remain idle, and any scratchpad request triggers an assertion explaining
-that storage is not implemented.
+At this scaffold stage the MMIO fields read as zero and ignore writes, and the
+DMA clients remain idle. Scratchpad accesses are functional, but no MMIO command
+can yet launch a transfer.
 
 ## License
 

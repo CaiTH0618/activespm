@@ -4,12 +4,17 @@ import freechips.rocketchip.diplomacy.AddressSet
 import freechips.rocketchip.prci.{ClockCrossingType, NoCrossing}
 import org.chipsalliance.cde.config.{Config, Field}
 
-/** Elaboration-time parameters for one ActiveSPM instance. */
+/** Elaboration-time parameters for one ActiveSPM instance.
+  *
+  * @param spadBeatBytes native scratchpad TileLink beat width, physical-bank
+  *   word width, bank-interleaving granularity, and DMA-local path width. This
+  *   is independent of the negotiated system-bus and external-DMA widths.
+  */
 case class ActiveSPMParams(
   id: Int,
   controlAddress: AddressSet,
   scratchpadAddress: AddressSet,
-  beatBytes: Int,
+  spadBeatBytes: Int,
   nBanks: Int,
   externalMemoryRanges: Seq[AddressSet],
   controlXType: ClockCrossingType = NoCrossing
@@ -26,12 +31,13 @@ case class ActiveSPMParams(
     s"ActiveSPM control range must cover offsets through 0x${ActiveSPMRegisters.errorCodeOffset.toHexString}")
   require(scratchpadAddress.finite && scratchpadAddress.contiguous,
     s"ActiveSPM scratchpad address must be a finite contiguous range, got $scratchpadAddress")
-  require(isPowerOfTwo(beatBytes), s"ActiveSPM beatBytes must be a power of two, got $beatBytes")
+  require(isPowerOfTwo(spadBeatBytes),
+    s"ActiveSPM spadBeatBytes must be a power of two, got $spadBeatBytes")
   require(isPowerOfTwo(nBanks), s"ActiveSPM nBanks must be a power of two, got $nBanks")
   require(isPowerOfTwo(scratchpadSize), s"ActiveSPM scratchpad size must be a power of two, got $scratchpadSize")
   require(scratchpadAddress.base % scratchpadSize == 0,
     s"ActiveSPM scratchpad base must be aligned to its size $scratchpadSize, got ${scratchpadAddress.base}")
-  require(scratchpadSize >= BigInt(beatBytes) * nBanks,
+  require(scratchpadSize >= BigInt(spadBeatBytes) * nBanks,
     s"ActiveSPM scratchpad must contain at least one beat per bank")
   require(externalMemoryRanges.nonEmpty, "ActiveSPM requires at least one allowed external-memory range")
   externalMemoryRanges.foreach { range =>
@@ -43,6 +49,25 @@ case class ActiveSPMParams(
   val scratchpadNodeName: String = s"activespm-spad[$id]"
   val dmaNodeName: String = s"activespm-dma[$id]"
   private[activespm] val localNodeName: String = s"activespm-local[$id]"
+
+  private[activespm] val bankSelectMask: BigInt = BigInt(nBanks - 1) * spadBeatBytes
+  private[activespm] val bankAddressMask: BigInt = scratchpadAddress.mask & ~bankSelectMask
+  private[activespm] val bankAddressSets: Seq[AddressSet] = Seq.tabulate(nBanks) { bankId =>
+    AddressSet(scratchpadAddress.base + BigInt(bankId) * spadBeatBytes, bankAddressMask)
+  }
+
+  private val bytesPerBank = scratchpadSize / nBanks
+  require(bankAddressSets.combinations(2).forall {
+    case Seq(left, right) => !left.overlaps(right)
+    case _ => true
+  }, s"ActiveSPM bank address sets must not overlap: ${bankAddressSets.mkString(", ")}")
+  require(bankAddressSets.forall { bank =>
+    scratchpadAddress.contains(bank.base) && (bank.mask & ~scratchpadAddress.mask) == 0
+  }, s"ActiveSPM bank address sets must stay inside $scratchpadAddress")
+  require(bankAddressSets.forall(bank => (BigInt(1) << bank.mask.bitCount) == bytesPerBank),
+    s"ActiveSPM banks must have equal capacity $bytesPerBank bytes")
+  require(bankAddressSets.map(bank => BigInt(1) << bank.mask.bitCount).sum == scratchpadSize,
+    s"ActiveSPM bank address sets must cover exactly $scratchpadSize bytes")
 }
 
 object ActiveSPMParams {

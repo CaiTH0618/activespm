@@ -22,7 +22,9 @@ trait CanHavePeripheryActiveSPM { this: BaseSubsystem =>
       controlXing := TLFragmenter(ActiveSPMRegisters.accessBytes, cbus.blockBytes) := TLWidthWidget(cbus.beatBytes) := _
     }
     sbus.coupleTo(params.scratchpadNodeName) {
-      activeSPM.scratchpadNode := TLFragmenter(params.beatBytes, sbus.blockBytes) := _
+      activeSPM.scratchpadNode :=
+        TLFIFOFixer() := TLFragmenter(params.spadBeatBytes, sbus.blockBytes) :=
+          TLWidthWidget(sbus.beatBytes) := _
     }
     sbus.coupleFrom(params.dmaNodeName) { _ := activeSPM.dmaNode }
 
