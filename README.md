@@ -14,8 +14,10 @@ transfer at a time through the 64-bit register interface.
 - `src/main/scala/activespm`: Parameters, interfaces, module shells, and system
   integration.
 - `src/test/scala/activespm`: Scala hardware tests.
-- `software/tests`: C tests.
+- `software/include`: The software-visible polling MMIO interface.
+- `software/tests`: C tests and their standalone bare-metal build.
 - `software/examples`: C example programs.
+- `scripts`: Integration-artifact checks.
 
 ## Building
 
@@ -32,6 +34,20 @@ attachment. `chipyard.ActiveSPMWideSBusScaffoldRocketConfig` verifies a 16-byte
 SBus attached to the scratchpad's 8-byte native interface. Both configurations
 can launch DMA transfers through MMIO, but remain development scaffolds rather
 than software-qualified production configurations.
+
+`chipyard.ActiveSPMDualGemminiMeshRocketConfig` is the multi-instance
+integration configuration. It contains two Huge Rocket cores, one default
+Gemmini per hart, two ActiveSPM instances, two inclusive-L2 banks, and a 128-bit
+SBus implemented as a full-channel 3x2 Constellation mesh. Its rows are:
+
+```text
+Core 0 + Gemmini 0 -- ActiveSPM 0 -- L2/system[0]
+Core 1 + Gemmini 1 -- ActiveSPM 1 -- L2/system[1]
+```
+
+The Core and Gemmini in a row share a router. Each ActiveSPM and each L2 bank
+has a dedicated router. An ActiveSPM DMA ingress and its aggregated scratchpad
+egress are colocated; the control manager remains on CBus.
 
 ## Interfaces
 
@@ -89,6 +105,36 @@ traffic.
 Hardware tests exercise the DMA both directly and through the complete MMIO
 control path, including unaligned transfers, negotiated width differences,
 descriptor failures, sticky status, and TileLink response errors.
+
+## Bare-metal integration test
+
+`software/include/activespm.h` exposes the stable 64-bit polling ABI without
+hiding hardware status or error codes. `activespm_start` writes a complete
+descriptor, applies a RISC-V memory fence, and starts one load or store. The
+caller owns polling and timeout policy; the header also provides status,
+completion, error, and W1C helpers.
+
+The dual-hart test belongs to this repository. It reuses the sibling Gemmini
+repository's generic multicore CRT/runtime and the `gemmini_params.h` generated
+by elaborating the matching SoC config; it does not add ActiveSPM sources to the
+Gemmini build. Build and run it from the Chipyard root with:
+
+```sh
+source env.sh
+make -C sims/verilator CONFIG=ActiveSPMDualGemminiMeshRocketConfig firrtl
+generators/activespm/scripts/check-dual-mesh.sh
+make -C generators/activespm/software/tests
+make -C sims/verilator CONFIG=ActiveSPMDualGemminiMeshRocketConfig \
+  BINARY="$PWD/generators/activespm/software/tests/build/dual-gemmini-mesh-baremetal" \
+  run-binary
+```
+
+Each hart operates only on its same-numbered Gemmini and ActiveSPM. Both harts
+concurrently run a DRAM-to-ActiveSPM load, Gemmini `mvin`/`mvout` through its
+private scratchpad, and an ActiveSPM-to-DRAM store. Distinct data patterns and
+guard bytes check data integrity and cross-instance isolation. This remains a
+development integration test, not a performance benchmark or production SoC
+configuration.
 
 ## License
 

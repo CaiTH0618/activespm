@@ -16,6 +16,7 @@ project/project/
 *.log
 *.vcd
 *.fst
+software/tests/build/
 
 # Editor and operating-system files
 *.swp
