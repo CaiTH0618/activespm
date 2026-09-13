@@ -2,7 +2,7 @@ package activespm
 
 import chisel3._
 import chisel3.util._
-import freechips.rocketchip.diplomacy.IdRange
+import freechips.rocketchip.diplomacy.{BufferParams, IdRange}
 import freechips.rocketchip.tilelink._
 import org.chipsalliance.cde.config.Parameters
 import org.chipsalliance.diplomacy.ValName
@@ -15,22 +15,40 @@ import org.chipsalliance.diplomacy.lazymodule.{LazyModule, LazyModuleImp}
   * byte-lane realignment between the two interfaces.
   */
 class ActiveSPMDMA(params: ActiveSPMParams)(implicit p: Parameters) extends LazyModule {
-  val externalNode = TLClientNode(Seq(TLMasterPortParameters.v1(Seq(TLMasterParameters.v1(
+  private val externalClientNode = TLClientNode(Seq(TLMasterPortParameters.v1(Seq(TLMasterParameters.v1(
     name = params.dmaNodeName,
     sourceId = IdRange(0, 1),
     visibility = params.externalMemoryRanges)))))(ValName(params.dmaNodeName))
 
-  val localNode = TLClientNode(Seq(TLMasterPortParameters.v1(Seq(TLMasterParameters.v1(
+  private val localClientNode = TLClientNode(Seq(TLMasterPortParameters.v1(Seq(TLMasterParameters.v1(
     name = params.localNodeName,
     sourceId = IdRange(0, 1),
     visibility = Seq(params.scratchpadAddress))))))(ValName(params.localNodeName))
+
+  // Register both request and response data at the DMA boundary. Besides
+  // providing explicit timing cut points around the byte realigner, these
+  // queues make every transaction accepted by the DMA irrevocable while it is
+  // waiting to reach the connected manager.
+  private def registeredClientBoundary(name: String, client: TLOutwardNode): TLIdentityNode = {
+    val boundary = TLIdentityNode()(ValName(name))
+    boundary := TLBuffer(
+      a = BufferParams(1, flow = false, pipe = false),
+      b = BufferParams.none,
+      c = BufferParams.none,
+      d = BufferParams(1, flow = false, pipe = false),
+      e = BufferParams.none) := client
+    boundary
+  }
+
+  val externalNode = registeredClientBoundary(params.dmaNodeName, externalClientNode)
+  val localNode = registeredClientBoundary(params.localNodeName, localClientNode)
 
   lazy val module = new Impl
   class Impl extends LazyModuleImp(this) {
     val control = IO(new ActiveSPMDMAControlIO)
 
-    private val (external, externalEdge) = externalNode.out.head
-    private val (local, localEdge) = localNode.out.head
+    private val (external, externalEdge) = externalClientNode.out.head
+    private val (local, localEdge) = localClientNode.out.head
     private val externalBeatBytes = external.params.dataBits / 8
     private val localBeatBytes = local.params.dataBits / 8
     private val maxBeatBytes = externalBeatBytes max localBeatBytes
@@ -235,12 +253,6 @@ class ActiveSPMDMA(params: ActiveSPMParams)(implicit p: Parameters) extends Lazy
       external.d.bits.denied || external.d.bits.corrupt)
     private val responseError = (sourceDFire && sourceDInvalid) ||
       (destinationDFire && destinationDInvalid)
-
-    // Prevent a new request from being accepted in the same cycle an error is observed.
-    when(responseError) {
-      external.a.valid := false.B
-      local.a.valid := false.B
-    }
 
     private val sourceResponseData = WireDefault(0.U((maxBeatBytes * 8).W))
     when(isLoad) { sourceResponseData := external.d.bits.data }

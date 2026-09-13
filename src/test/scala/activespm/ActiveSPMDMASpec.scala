@@ -5,7 +5,7 @@ import chisel3.util._
 import chiseltest._
 import chiseltest.simulator.{VerilatorBackendAnnotation, VerilatorFlags}
 import firrtl2.options.TargetDirAnnotation
-import freechips.rocketchip.diplomacy.AddressSet
+import freechips.rocketchip.diplomacy.{AddressSet, IdRange}
 import freechips.rocketchip.tilelink._
 import org.chipsalliance.cde.config.Parameters
 import org.chipsalliance.diplomacy.lazymodule.{LazyModule, LazyModuleImp}
@@ -165,7 +165,8 @@ private class TLResponseFault(faultAt: Int, denied: Boolean, corrupt: Boolean)
 private class ActiveSPMDMAControlHarness(
   params: ActiveSPMParams,
   externalBeatBytes: Int,
-  fault: Option[(Int, Boolean, Boolean)] = None)(implicit p: Parameters) extends LazyModule {
+  externalFault: Option[(Int, Boolean, Boolean)] = None,
+  localFault: Option[(Int, Boolean, Boolean)] = None)(implicit p: Parameters) extends LazyModule {
   private val dma = LazyModule(new ActiveSPMDMA(params))
   private val externalRAM = LazyModule(new TLRAM(
     AddressSet(params.externalMemoryRanges.head.base, 0x1fffL),
@@ -177,19 +178,35 @@ private class ActiveSPMDMAControlHarness(
   private val unusedGlobal = LazyModule(new TLPatternPusher(
     "unused-global", Seq(ReadPattern(params.scratchpadAddress.base, log2Ceil(params.spadBeatBytes)))))
 
-  fault match {
+  externalFault match {
     case Some((at, denied, corrupt)) =>
       val injector = LazyModule(new TLResponseFault(at, denied, corrupt))
       externalRAM.node := injector.node := dma.externalNode
     case None => externalRAM.node := dma.externalNode
   }
-  scratchpad.localNode := dma.localNode
+  localFault match {
+    case Some((at, denied, corrupt)) =>
+      val injector = LazyModule(new TLResponseFault(at, denied, corrupt))
+      scratchpad.localNode := injector.node := dma.localNode
+    case None => scratchpad.localNode := dma.localNode
+  }
   scratchpad.globalNode := unusedGlobal.node
 
   lazy val module = new Impl
   class Impl extends LazyModuleImp(this) {
     val control = IO(new ActiveSPMDMAControlIO)
     unusedGlobal.module.io.run := false.B
+
+    private val externalMasters = dma.externalNode.out.head._2.master.masters
+    private val localMasters = dma.localNode.out.head._2.master.masters
+    require(externalMasters.size == 1)
+    require(externalMasters.head.name == params.dmaNodeName)
+    require(externalMasters.head.sourceId == IdRange(0, 1))
+    require(externalMasters.head.visibility == params.externalMemoryRanges)
+    require(localMasters.size == 1)
+    require(localMasters.head.name == params.localNodeName)
+    require(localMasters.head.sourceId == IdRange(0, 1))
+    require(localMasters.head.visibility == Seq(params.scratchpadAddress))
 
     dma.module.control.request.valid := control.request.valid
     dma.module.control.request.bits := control.request.bits
@@ -204,12 +221,13 @@ private class ActiveSPMDMAControlHarness(
 private class ActiveSPMDMAControlTop(
   params: ActiveSPMParams,
   externalBeatBytes: Int,
-  fault: Option[(Int, Boolean, Boolean)],
+  externalFault: Option[(Int, Boolean, Boolean)],
+  localFault: Option[(Int, Boolean, Boolean)],
   topName: String)(implicit p: Parameters) extends Module {
   override val desiredName = topName
   val control = IO(new ActiveSPMDMAControlIO)
   private val harness = Module(LazyModule(new ActiveSPMDMAControlHarness(
-    params, externalBeatBytes, fault)).module)
+    params, externalBeatBytes, externalFault, localFault)).module)
   harness.control <> control
 }
 
@@ -334,7 +352,7 @@ class ActiveSPMDMASpec extends AnyFlatSpec with ChiselScalatestTester {
     val validationParams = params.copy(externalMemoryRanges = Seq(
       AddressSet(externalBase, 0xffL), AddressSet(externalBase + 0x100, 0xffL)))
     val topName = s"ActiveSPMDMAControlTop${nextTopId.getAndIncrement()}"
-    test(new ActiveSPMDMAControlTop(validationParams, 8, None, topName))
+    test(new ActiveSPMDMAControlTop(validationParams, 8, None, None, topName))
       .withAnnotations(annotations(topName)) { dut =>
         dut.control.request.valid.poke(false.B)
         dut.control.completion.ready.poke(false.B)
@@ -374,13 +392,12 @@ class ActiveSPMDMASpec extends AnyFlatSpec with ChiselScalatestTester {
   it should "report source and destination TileLink failures" in {
     def runFault(
       direction: ActiveSPMDirection.Type,
-      faultAt: Int,
-      denied: Boolean,
-      corrupt: Boolean,
+      externalFault: Option[(Int, Boolean, Boolean)],
+      localFault: Option[(Int, Boolean, Boolean)],
       expectedBytes: BigInt): Unit = {
       val topName = s"ActiveSPMDMAControlTop${nextTopId.getAndIncrement()}"
-      test(new ActiveSPMDMAControlTop(params, 8,
-        Some((faultAt, denied, corrupt)), topName)).withAnnotations(annotations(topName)) { dut =>
+      test(new ActiveSPMDMAControlTop(
+        params, 8, externalFault, localFault, topName)).withAnnotations(annotations(topName)) { dut =>
         dut.control.request.valid.poke(false.B)
         dut.control.completion.ready.poke(false.B)
         dut.clock.step(2)
@@ -389,8 +406,15 @@ class ActiveSPMDMASpec extends AnyFlatSpec with ChiselScalatestTester {
       }
     }
 
-    runFault(ActiveSPMDirection.load, faultAt = 0, denied = false, corrupt = true, expectedBytes = 0)
-    runFault(ActiveSPMDirection.load, faultAt = 0, denied = true, corrupt = false, expectedBytes = 0)
-    runFault(ActiveSPMDirection.store, faultAt = 1, denied = true, corrupt = false, expectedBytes = 8)
+    runFault(ActiveSPMDirection.load,
+      externalFault = Some((0, false, true)), localFault = None, expectedBytes = 0)
+    runFault(ActiveSPMDirection.load,
+      externalFault = Some((0, true, false)), localFault = None, expectedBytes = 0)
+    runFault(ActiveSPMDirection.store,
+      externalFault = Some((1, true, false)), localFault = None, expectedBytes = 8)
+    runFault(ActiveSPMDirection.load,
+      externalFault = None, localFault = Some((0, true, false)), expectedBytes = 0)
+    runFault(ActiveSPMDirection.store,
+      externalFault = None, localFault = Some((0, false, true)), expectedBytes = 0)
   }
 }
