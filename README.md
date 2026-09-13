@@ -5,8 +5,9 @@ globally addressable scratchpad memory. The generator is intended to be used by
 the customized NPU subsystem in Chipyard.
 
 This repository currently contains an elaboratable Scala interface framework,
-a functional banked scratchpad, and a functional DMA datapath. The MMIO
-register block remains a reserved shell and cannot yet launch a transfer.
+a functional banked scratchpad, a functional DMA datapath, and a polling MMIO
+control block. Software or a hardware master can configure and launch one DMA
+transfer at a time through the 64-bit register interface.
 
 ## Directory Layout
 
@@ -28,8 +29,9 @@ sbt "activespm/test" "chipyard/compile"
 
 `chipyard.ActiveSPMScaffoldRocketConfig` verifies the same-width subsystem
 attachment. `chipyard.ActiveSPMWideSBusScaffoldRocketConfig` verifies a 16-byte
-SBus attached to the scratchpad's 8-byte native interface. Both remain scaffold
-configurations because their MMIO control registers cannot launch the DMA.
+SBus attached to the scratchpad's 8-byte native interface. Both configurations
+can launch DMA transfers through MMIO, but remain development scaffolds rather
+than software-qualified production configurations.
 
 ## Interfaces
 
@@ -55,6 +57,19 @@ channel. DMA completion also uses a Decoupled channel so the result remains
 stable until accepted. Live busy and byte-count progress are reported
 separately without a handshake.
 
+The polling register block uses aligned 64-bit accesses. Software writes the
+external physical address at `0x08`, the local scratchpad offset at `0x10`, and
+the byte count at `0x18`, then writes `START` in bit 0 of `COMMAND` at `0x00`;
+bit 1 selects store rather than load. `STATUS` at `0x20` reports `BUSY`, sticky
+`DONE`, and sticky `ERROR`. `BYTES_COMPLETED` at `0x28` and `ERROR_CODE` at
+`0x30` retain the final result. Writing one to the `DONE` or `ERROR` status bit
+clears it, and clearing `ERROR` also clears its code.
+
+Descriptor registers may be updated while a command is active without changing
+the captured request. A second `START` while busy is rejected, leaves the active
+DMA untouched, and records the `BUSY` error. If that active DMA later succeeds,
+`DONE` and the rejected-start `ERROR` can both remain set for software to clear.
+
 The DMA copies bytes in either direction between external physical memory and
 the local scratchpad. It accepts arbitrary source address, destination address,
 and length alignment, including different byte-lane offsets and different
@@ -71,9 +86,9 @@ flight, and return the acknowledged contiguous destination prefix through
 `bytesCompleted`. A zero-length request succeeds without issuing TileLink
 traffic.
 
-DMA behavior is currently exercised directly through the hardware
-control-to-DMA interface. The reserved MMIO fields still read as zero and ignore
-writes, so no MMIO command can launch a transfer yet.
+Hardware tests exercise the DMA both directly and through the complete MMIO
+control path, including unaligned transfers, negotiated width differences,
+descriptor failures, sticky status, and TileLink response errors.
 
 ## License
 
