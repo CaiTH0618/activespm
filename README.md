@@ -122,7 +122,6 @@ Gemmini build. Build and run it from the Chipyard root with:
 ```sh
 source env.sh
 make -C sims/verilator CONFIG=ActiveSPMDualGemminiMeshRocketConfig firrtl
-generators/activespm/scripts/check-dual-mesh.sh
 make -C generators/activespm/software/tests
 make -C sims/verilator CONFIG=ActiveSPMDualGemminiMeshRocketConfig \
   BINARY="$PWD/generators/activespm/software/tests/build/dual-gemmini-mesh-baremetal" \
