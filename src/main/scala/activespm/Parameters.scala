@@ -17,10 +17,31 @@ case class ActiveSPMParams(
   spadBeatBytes: Int,
   nBanks: Int,
   externalMemoryRanges: Seq[AddressSet],
-  controlXType: ClockCrossingType = NoCrossing
+  controlXType: ClockCrossingType = NoCrossing,
+  dmaMaxInFlight: Int = 1,
+  dmaBufferBytes: Int = 128,
+  dmaLocalPorts: Int = 1,
+  dmaLocalInFlight: Int = 1,
+  globalPipelineDepth: Int = 0,
+  bankResponseQueueDepth: Int = 0,
+  descQueueDepth: Int = 0
 ) {
   private def isPowerOfTwo(value: BigInt): Boolean = value > 0 && (value & (value - 1)) == 0
   val scratchpadSize: BigInt = scratchpadAddress.mask + 1
+
+  require(isPowerOfTwo(dmaMaxInFlight) && isPowerOfTwo(dmaLocalInFlight))
+  require(dmaLocalPorts >= 1 && globalPipelineDepth >= 0 && bankResponseQueueDepth >= 0)
+  require(descQueueDepth >= 0)
+  if (descQueueDepth > 0) {
+    require(dmaMaxInFlight >= 2 && scratchpadSize >= 64,
+      "DeSC admission requires the concurrent 64-byte DMA path")
+  }
+  if (dmaMaxInFlight > 1) {
+    require(spadBeatBytes == 32 && dmaLocalPorts == 2,
+      "Concurrent DMA uses two internal 256-bit ports")
+    require(dmaBufferBytes == dmaMaxInFlight * 64,
+      "Every outstanding external transaction reserves one 64-byte data slot")
+  }
 
   require(id >= 0, s"ActiveSPM instance ID must be non-negative, got $id")
   require(controlAddress.finite && controlAddress.contiguous,

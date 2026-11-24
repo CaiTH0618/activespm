@@ -11,9 +11,50 @@ Software can launch one DMA transfer at a time through the 64-bit register
 interface. Transfers support arbitrary byte alignment and length between the
 local scratchpad and configured external physical-memory ranges.
 
-The initial design uses one outstanding transaction on each DMA TileLink
-interface and has no interrupt, descriptor queue, address translation, ECC, or
-hardware buffer-ownership tracking.
+The default configuration uses one outstanding transaction on each DMA TileLink
+interface. An optional concurrent configuration retains the same MMIO and TL
+slave interfaces, but pipelines aligned bulk transfers using multiple external
+source IDs, a bounded flop data window and two private 256-bit SRAM paths.
+Neither configuration adds interrupts, a software descriptor API, address
+translation, ECC, or hardware buffer-ownership tracking.
+
+The XDNA area configuration selects `dmaMaxInFlight=64`,
+`dmaBufferBytes=4096`, `dmaLocalPorts=2`, `dmaLocalInFlight=16`,
+`globalPipelineDepth=8` and `bankResponseQueueDepth=2`. The data window is
+64 x 64 bytes of flops, reused by LOAD and STORE; all slots reserve capacity
+before requests issue. An ordered global ingress preserves FIFO execution and
+response order without waiting for every previous D response. Bank request
+handshakes execute physical single-port SRAM accesses directly; bank response
+queues and the ingress response slots absorb return-path backpressure.
+
+The software still submits one continuous-address command. Aligned bulk data
+uses the concurrent engine, then a short tail uses the byte engine; unaligned
+commands use the byte engine throughout. Completion waits for acknowledged
+destination writes. Errors stop new issues and drain accepted transactions.
+The scratchpad address range, bank mapping, byte-write behavior and original
+MMIO register semantics are unchanged. Concurrent DMA changes only its master
+source-ID range and private local clients, so integration/NoC metadata must
+reflect the selected concurrency. The physical SRAM capacity and geometry
+do not change, and DMA never initiates copies to Gemmini or other SRAMs.
+
+For the DeSC MemTile, set `descQueueDepth=8` on the same concurrent DMA.
+The additional sideband accepts aligned 64-byte decoder transfer descriptors
+(external address and local offset in 64-byte units). Two queues hold inference
+and decoder descriptors. Both use the shared DMA slots and SRAM ports.
+At most half of the slots can be occupied by the decoder, including stores
+waiting for data. The external A-channel arbiter grants a programmable fraction
+`decoderWeight/16` of requests to decoding when both classes can issue.
+With a positive weight, either class can use the external port when its peer
+cannot issue. Weight zero stops new decoder grants and leaves already
+committed TileLink requests to finish.
+
+The configuration sideband writes the weight and per-class byte and burst
+limits atomically. Each request consumes 64 bytes and one burst of credit.
+Credit returns on the external D response. Completion counters report
+acknowledged destination bytes from the aligned path per class. Class 0 is
+inference and class 1 is decoding. The existing MMIO covers the inference
+command, including byte-aligned fallback and tails. That engine temporarily
+owns the TileLink ports after accepted fast-path traffic has drained.
 
 ## Directory Layout
 

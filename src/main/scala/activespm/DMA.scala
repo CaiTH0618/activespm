@@ -8,47 +8,21 @@ import org.chipsalliance.cde.config.Parameters
 import org.chipsalliance.diplomacy.ValName
 import org.chipsalliance.diplomacy.lazymodule.{LazyModule, LazyModuleImp}
 
-/** Byte-accurate, single-request DMA between external memory and the local scratchpad.
-  *
-  * Each TileLink interface has one source ID. A source Get and a destination Put may
-  * be outstanding at the same time, with a bounded byte FIFO performing width and
-  * byte-lane realignment between the two interfaces.
+/** Byte-accurate compatibility engine for arbitrary alignment and short tails.
+  * The concurrent wrapper uses it only after all fast-path transactions drain.
   */
-class ActiveSPMDMA(params: ActiveSPMParams)(implicit p: Parameters) extends LazyModule {
-  private val externalClientNode = TLClientNode(Seq(TLMasterPortParameters.v1(Seq(TLMasterParameters.v1(
-    name = params.dmaNodeName,
-    sourceId = IdRange(0, 1),
-    visibility = params.externalMemoryRanges)))))(ValName(params.dmaNodeName))
+private[activespm] class ActiveSPMByteDMA(
+  params: ActiveSPMParams, externalEdge: TLEdgeOut, localEdge: TLEdgeOut
+)(implicit p: Parameters) extends Module {
+    val io = IO(new Bundle {
+      val control = new ActiveSPMDMAControlIO
+      val external = new TLBundle(externalEdge.bundle)
+      val local = new TLBundle(localEdge.bundle)
+    })
+    val control = io.control
+    private val external = io.external
+    private val local = io.local
 
-  private val localClientNode = TLClientNode(Seq(TLMasterPortParameters.v1(Seq(TLMasterParameters.v1(
-    name = params.localNodeName,
-    sourceId = IdRange(0, 1),
-    visibility = Seq(params.scratchpadAddress))))))(ValName(params.localNodeName))
-
-  // Register both request and response data at the DMA boundary. Besides
-  // providing explicit timing cut points around the byte realigner, these
-  // queues make every transaction accepted by the DMA irrevocable while it is
-  // waiting to reach the connected manager.
-  private def registeredClientBoundary(name: String, client: TLOutwardNode): TLIdentityNode = {
-    val boundary = TLIdentityNode()(ValName(name))
-    boundary := TLBuffer(
-      a = BufferParams(1, flow = false, pipe = false),
-      b = BufferParams.none,
-      c = BufferParams.none,
-      d = BufferParams(1, flow = false, pipe = false),
-      e = BufferParams.none) := client
-    boundary
-  }
-
-  val externalNode = registeredClientBoundary(params.dmaNodeName, externalClientNode)
-  val localNode = registeredClientBoundary(params.localNodeName, localClientNode)
-
-  lazy val module = new Impl
-  class Impl extends LazyModuleImp(this) {
-    val control = IO(new ActiveSPMDMAControlIO)
-
-    private val (external, externalEdge) = externalClientNode.out.head
-    private val (local, localEdge) = localClientNode.out.head
     private val externalBeatBytes = external.params.dataBits / 8
     private val localBeatBytes = local.params.dataBits / 8
     private val maxBeatBytes = externalBeatBytes max localBeatBytes
@@ -386,5 +360,4 @@ class ActiveSPMDMA(params: ActiveSPMParams)(implicit p: Parameters) extends Lazy
       assert(opcode === TLMessages.AccessAck,
         "ActiveSPM DMA destination transaction received a non-AccessAck response")
     }
-  }
 }
