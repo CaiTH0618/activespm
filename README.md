@@ -1,8 +1,7 @@
 # ActiveSPM
 
 ActiveSPM is a Chipyard generator for a software-controlled DMA engine with a
-globally addressable scratchpad memory. The generator is intended to be used by
-the customized NPU subsystem in Chipyard.
+globally addressable scratchpad memory.
 
 The current implementation provides a shared banked scratchpad, a bidirectional
 byte-accurate DMA datapath, a polling MMIO control block, multi-instance
@@ -18,26 +17,30 @@ source IDs, a bounded flop data window and two private 256-bit SRAM paths.
 Neither configuration adds interrupts, a software descriptor API, address
 translation, ECC, or hardware buffer-ownership tracking.
 
-The XDNA area configuration selects `dmaMaxInFlight=64`,
+For example, a concurrent configuration can select `dmaMaxInFlight=64`,
 `dmaBufferBytes=4096`, `dmaLocalPorts=2`, `dmaLocalInFlight=16`,
-`globalPipelineDepth=8` and `bankResponseQueueDepth=2`. The data window is
-64 x 64 bytes of flops, reused by LOAD and STORE; all slots reserve capacity
-before requests issue. An ordered global ingress preserves FIFO execution and
-response order without waiting for every previous D response. Bank request
-handshakes execute physical single-port SRAM accesses directly; bank response
-queues and the ingress response slots absorb return-path backpressure.
+`globalPipelineDepth=8` and `bankResponseQueueDepth=2`. Its data window holds
+64 slots of 64 bytes each, reused by LOAD and STORE. Requests reserve a slot
+before issue. The external TileLink port is 512 bits wide and the external
+memory managers must support 64-byte Get and PutFullData requests. An ordered
+global ingress preserves FIFO execution and response order. Bank request
+handshakes execute physical single-port SRAM accesses directly. Bank response
+queues and ingress response slots absorb return-path backpressure.
 
 The software still submits one continuous-address command. Aligned bulk data
 uses the concurrent engine, then a short tail uses the byte engine; unaligned
 commands use the byte engine throughout. Completion waits for acknowledged
-destination writes. Errors stop new issues and drain accepted transactions.
+destination writes. `BYTES_COMPLETED` advances over the contiguous acknowledged
+prefix of the destination in address order. Errors stop new issues and drain
+accepted transactions before reporting that prefix.
 The scratchpad address range, bank mapping, byte-write behavior and original
 MMIO register semantics are unchanged. Concurrent DMA changes only its master
 source-ID range and private local clients, so integration/NoC metadata must
 reflect the selected concurrency. The physical SRAM capacity and geometry
 do not change, and DMA never initiates copies to Gemmini or other SRAMs.
 
-For the DeSC MemTile, set `descQueueDepth=8` on the same concurrent DMA.
+Set `descQueueDepth` to a positive value to enable DeSC request arbitration on
+the concurrent DMA.
 The additional sideband accepts aligned 64-byte decoder transfer descriptors
 (external address and local offset in 64-byte units). Two queues hold inference
 and decoder descriptors. Both use the shared DMA slots and SRAM ports.
@@ -50,8 +53,8 @@ committed TileLink requests to finish.
 
 The configuration sideband writes the weight and per-class byte and burst
 limits atomically. Each request consumes 64 bytes and one burst of credit.
-Credit returns on the external D response. Completion counters report
-acknowledged destination bytes from the aligned path per class. Class 0 is
+Credit returns on the external D response. Sideband completion counters count
+all acknowledged destination bytes from the aligned path per class. Class 0 is
 inference and class 1 is decoding. The existing MMIO covers the inference
 command, including byte-aligned fallback and tails. That engine temporarily
 owns the TileLink ports after accepted fast-path traffic has drained.
@@ -107,8 +110,8 @@ egress are colocated; the control manager remains on CBus.
 
 Each instance exposes three TileLink interfaces: a 64-bit MMIO control manager,
 an aggregated scratchpad data manager, and an external-memory DMA client. The
-DMA also has a private TileLink client connected to the scratchpad's internal
-manager; that path does not leave the instance.
+DMA also connects to the scratchpad through private TileLink paths. The first
+uses `activespm-local[i]` and the concurrent path adds `activespm-local[i]-1`.
 
 The control manager attaches to CBus. The aggregated scratchpad manager and
 external DMA client attach to SBus; on a Constellation NoC they use the stable

@@ -70,6 +70,8 @@ case class ActiveSPMParams(
   val scratchpadNodeName: String = s"activespm-spad[$id]"
   val dmaNodeName: String = s"activespm-dma[$id]"
   private[activespm] val localNodeName: String = s"activespm-local[$id]"
+  private[activespm] def localLaneName(lane: Int): String =
+    if (lane == 0) localNodeName else s"$localNodeName-$lane"
 
   private[activespm] val bankSelectMask: BigInt = BigInt(nBanks - 1) * spadBeatBytes
   private[activespm] val bankAddressMask: BigInt = scratchpadAddress.mask & ~bankSelectMask

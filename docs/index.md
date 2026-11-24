@@ -8,14 +8,13 @@ accelerator accesses the scratchpad through its system address, while the DMA
 moves an arbitrary byte range between that same storage and an allowed external
 physical-memory range.
 
-An ActiveSPM instance is intended to act as a software-managed staging point in
-the NPU subsystem. Rocket cores configure transfers through a polling MMIO
-interface, Gemmini reaches ActiveSPM through its existing system-bus DMA, and
-the ActiveSPM DMA independently transfers data between its local scratchpad and
-memory. Hardware provides the movement mechanisms; software remains responsible
-for buffer ownership and synchronization.
+An ActiveSPM instance acts as a software-managed staging point between compute
+engines and memory. In the example system, Rocket cores configure transfers
+through polling MMIO and Gemmini accesses the scratchpad through its existing
+system-bus DMA. ActiveSPM independently moves data between that scratchpad and
+external memory. Software manages buffer ownership and synchronization.
 
-The current design has one active DMA command, one outstanding transaction on
+The default design has one active DMA command, one outstanding transaction on
 each DMA TileLink interface, one clock domain per instance, and no interrupt,
 command queue, address translation, ECC, or hardware data-hazard tracking.
 

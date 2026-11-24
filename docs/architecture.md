@@ -1,8 +1,8 @@
 # ActiveSPM Architecture
 
-## Role in the NPU Subsystem
+## Role in the System
 
-ActiveSPM provides a software-managed memory tile between compute engines and
+ActiveSPM provides a software-managed scratchpad between compute engines and
 external memory. Its scratchpad is part of the global physical address map, so
 Rocket cores, Gemmini DMA engines, and other permitted TileLink masters can
 access it like a memory region. Its own DMA engine uses a private local path to

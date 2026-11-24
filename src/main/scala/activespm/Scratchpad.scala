@@ -28,8 +28,7 @@ class ActiveSPMScratchpad(params: ActiveSPMParams)(implicit p: Parameters) exten
     managerFn = port => port.v2copy(slaves = Seq(aggregatedManager(name))))(ValName(name))
 
   val globalNode = aggregateNode(params.scratchpadNodeName)
-  val localNodes = Seq.tabulate(params.dmaLocalPorts)(lane =>
-    aggregateNode(s"${params.localNodeName}-$lane"))
+  val localNodes = Seq.tabulate(params.dmaLocalPorts)(lane => aggregateNode(params.localLaneName(lane)))
   val localNode = localNodes.head
 
   private val bankXbar = TLXbar(TLArbiter.roundRobin)

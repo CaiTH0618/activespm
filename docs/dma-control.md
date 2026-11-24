@@ -26,8 +26,8 @@ The control block and DMA communicate through three logical interfaces:
 | Interface | Handshake | Information |
 | --- | --- | --- |
 | Request | Ready/valid | Direction and complete captured descriptor |
-| Progress | Sampled status | Live busy state and acknowledged destination-byte count |
-| Completion | Ready/valid | Final error code and acknowledged destination-byte count |
+| Progress | Sampled status | Live busy state and acknowledged destination-prefix length |
+| Completion | Ready/valid | Final error code and acknowledged destination-prefix length |
 
 The control block snapshots all descriptor fields atomically when it accepts an
 idle `START`. It then keeps the request stable until the DMA accepts it. The DMA
@@ -53,10 +53,16 @@ For every accepted request, the DMA follows this sequence:
 7. Complete after all bytes have been acknowledged at the destination, or stop
    and drain already issued transactions after an error.
 
-Each external and local DMA interface has one source ID and allows at most one
-outstanding transaction. A source read and a destination write may be in flight
-at the same time. Registered request and response boundaries provide bounded
-backpressure isolation around the realignment path.
+In the default byte DMA, each external and local interface has one source ID
+and allows at most one outstanding transaction. A source read and a destination
+write may be in flight at the same time. Registered request and response
+boundaries provide bounded backpressure isolation around the realignment path.
+
+The optional concurrent engine pipelines 64-byte aligned bursts for a single
+MMIO command. Acknowledgments can arrive out of order. Progress advances in
+destination address order and stops at the first unacknowledged byte. For a
+LOAD, a successful first 32-byte write can advance progress before the second
+write is acknowledged. The byte DMA handles unaligned transfers and short tails.
 
 A zero-length request succeeds without issuing TileLink traffic. Its addresses
 are not dereferenced, and its completed-byte count is zero.

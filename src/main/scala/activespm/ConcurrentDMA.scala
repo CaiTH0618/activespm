@@ -18,7 +18,7 @@ class ActiveSPMDMA(params: ActiveSPMParams)(implicit p: Parameters) extends Lazy
       sourceId = IdRange(0, params.dmaMaxInFlight), visibility = params.externalMemoryRanges)))))
   private val localClients = Seq.tabulate(params.dmaLocalPorts) { lane =>
     TLClientNode(Seq(TLMasterPortParameters.v1(Seq(TLMasterParameters.v1(
-      name = s"${params.localNodeName}-$lane", sourceId = IdRange(0, params.dmaLocalInFlight),
+      name = params.localLaneName(lane), sourceId = IdRange(0, params.dmaLocalInFlight),
       visibility = Seq(params.scratchpadAddress))))))
   }
   private def boundary(name: String, client: TLOutwardNode): TLIdentityNode = {
@@ -30,7 +30,7 @@ class ActiveSPMDMA(params: ActiveSPMParams)(implicit p: Parameters) extends Lazy
   }
   val externalNode = boundary(params.dmaNodeName, externalClient)
   val localNodes = localClients.zipWithIndex.map { case (client, lane) =>
-    boundary(s"${params.localNodeName}-$lane", client)
+    boundary(params.localLaneName(lane), client)
   }
   val localNode = localNodes.head
 
@@ -202,6 +202,7 @@ private[activespm] class ActiveSPMConcurrentDMA(
   private val returned = RegInit(VecInit(Seq.fill(n)(false.B)))
   private val localIssued = Seq.fill(2)(RegInit(VecInit(Seq.fill(n)(false.B))))
   private val localDone = Seq.fill(2)(RegInit(VecInit(Seq.fill(n)(false.B))))
+  private val destinationAcked = Seq.fill(2)(Reg(Vec(n, Bool())))
   // Exactly n * 2 * 256 bits. Never reset or shift the entire data window.
   private val data = Seq.fill(2)(Reg(Vec(n, UInt(256.W))))
   private val localPtr = Seq.fill(2)(RegInit(0.U(indexBits.W)))
@@ -211,6 +212,7 @@ private[activespm] class ActiveSPMConcurrentDMA(
   private val fatal = RegInit(false.B)
   private val error = RegInit(ActiveSPMErrorCode.none)
   private val completed = RegInit(0.U(64.W))
+  private val prefixBlocked = RegInit(false.B)
   private val descriptors = Option.when(descEnabled)(Reg(Vec(n, new ActiveSPMDeSCBurst(params))))
   private val decodeClass = Option.when(descEnabled)(Reg(Vec(n, Bool())))
   private val failed = Option.when(descEnabled)(Reg(Vec(n, Bool())))
@@ -224,13 +226,17 @@ private[activespm] class ActiveSPMConcurrentDMA(
     descriptors.fold(externalBase + offsets(slot))(_(slot).externalAddress)
   private def localAddress(slot: UInt): UInt =
     descriptors.fold(localBase + offsets(slot))(d => params.scratchpadAddress.base.U + d(slot).localOffset)
+  private def slotFinished(slot: UInt): Bool =
+    externalDone(slot) && localDone.map(_(slot)).reduce(_ && _)
+  private def slotDrained(slot: UInt): Bool =
+    !externalPending(slot) && !(0 until 2).map(lane => localIssued(lane)(slot) &&
+      !localDone(lane)(slot)).reduce(_ || _)
 
   io.control.request.ready := state === idle
   io.control.completion.valid := state === complete
   io.control.completion.bits.errorCode := error
   io.control.completion.bits.bytesCompleted := completed
   io.control.progress.busy := state === active
-  io.control.progress.bytesCompleted := completed
 
   def defaults(tl: TLBundle): Unit = {
     tl.a.valid := false.B
@@ -248,8 +254,16 @@ private[activespm] class ActiveSPMConcurrentDMA(
   val allocate = WireDefault(running && nextOffset < length && occupancy < n.U)
   val allocateSlot = WireDefault(allocatePtr)
   val retireSlot = WireDefault(retirePtr)
-  val retire = WireDefault(running && allocated(retirePtr) && externalDone(retirePtr) &&
-    localDone.map(_(retirePtr)).reduce(_ && _))
+  val retire = WireDefault(state === active && allocated(retirePtr) &&
+    (slotFinished(retirePtr) || (fatal && slotDrained(retirePtr))))
+  val commandHead = WireDefault(retirePtr)
+  val commandHeadValid = WireDefault(allocated(retirePtr))
+  // Include the acknowledged low half of an unfinished LOAD at the head.
+  // Retiring a partial or failed burst fixes the final prefix at that gap.
+  val headBytes = Mux(commandHeadValid && !prefixBlocked && destinationAcked(0)(commandHead),
+    Mux(destinationAcked(1)(commandHead), 64.U, 32.U), 0.U)
+  val completedWithHead = completed + headBytes
+  io.control.progress.bytesCompleted := Mux(state === active, completedWithHead, completed)
   val issueSlot = WireDefault(externalPtr)
   val localIssueSlot = WireDefault(VecInit(localPtr))
   val localCanIssue = WireDefault(VecInit((0 until 2).map { lane =>
@@ -272,19 +286,21 @@ private[activespm] class ActiveSPMConcurrentDMA(
   }
   val externalResponseClass = isDecode(externalResponseSlot)
   val localResponseClasses = localResponseSlots.map(isDecode)
-  val inferenceBad = (externalBad && !externalResponseClass) ||
+  val commandFailed = (externalBad && !externalResponseClass) ||
     localBad.zip(localResponseClasses).map { case (bad, decoder) => bad && !decoder }.reduce(_ || _)
-  def completedBytes(decoding: Bool): UInt = {
-    val loadBytes = io.local.zip(localResponseSlots).zip(localBad).map { case ((tl, slot), bad) =>
-      Mux(tl.d.fire && !bad && isLoad(slot) && isDecode(slot) === decoding, 32.U(7.W), 0.U(7.W))
+  val externalWriteAck = io.external.d.fire && !externalBad && !isLoad(externalResponseSlot)
+  val localWriteAcks = io.local.zip(localResponseSlots).zip(localBad).map { case ((tl, slot), bad) =>
+    tl.d.fire && !bad && isLoad(slot)
+  }
+  def acknowledgedBytes(decoding: Bool): UInt = {
+    val loadBytes = localWriteAcks.zip(localResponseClasses).map { case (ack, decoder) =>
+      Mux(ack && decoder === decoding, 32.U(7.W), 0.U(7.W))
     }.reduce(_ +& _)
-    val storeBytes = Mux(io.external.d.fire && !externalBad &&
-      !isLoad(externalResponseSlot) && externalResponseClass === decoding, 64.U(8.W), 0.U(8.W))
+    val storeBytes = Mux(externalWriteAck && externalResponseClass === decoding, 64.U(8.W), 0.U(8.W))
     loadBytes + storeBytes
   }
-  val inferenceBytes = completedBytes(false.B)
   val drained = !externalPending.reduce(_ || _) && !localBusy.map(_.reduce(_ || _)).reduce(_ || _)
-  val inferenceDrained = WireDefault(occupancy === 0.U && drained)
+  val commandDrained = WireDefault(occupancy === 0.U && drained)
   val advanceOffset = WireDefault(allocate)
 
   io.desc.foreach { port =>
@@ -294,18 +310,18 @@ private[activespm] class ActiveSPMConcurrentDMA(
     admission.io.pause := paused
     admission.io.responseClass.valid := io.external.d.fire
     admission.io.responseClass.bits := externalResponseClass
-    admission.io.completed(0) := inferenceBytes
-    admission.io.completed(1) := completedBytes(true.B)
+    admission.io.completed(0) := acknowledgedBytes(false.B)
+    admission.io.completed(1) := acknowledgedBytes(true.B)
     port.inFlightBursts := admission.io.inFlightBursts
     port.completedBytes := admission.io.completedBytes
 
-    val inference = Module(new Queue(new ActiveSPMDeSCBurst(params), params.descQueueDepth, hasFlush = true))
-    inference.io.flush.get := fatal
-    inference.io.enq.valid := running && nextOffset < length
-    inference.io.enq.bits.externalBlockAddress := (externalBase + nextOffset) >> 6
-    inference.io.enq.bits.scratchpadBlockOffset := (localBase - params.scratchpadAddress.base.U + nextOffset) >> 6
-    inference.io.enq.bits.store := !load
-    advanceOffset := inference.io.enq.fire
+    val commandBursts = Module(new Queue(new ActiveSPMDeSCBurst(params), params.descQueueDepth, hasFlush = true))
+    commandBursts.io.flush.get := fatal
+    commandBursts.io.enq.valid := running && nextOffset < length
+    commandBursts.io.enq.bits.externalBlockAddress := (externalBase + nextOffset) >> 6
+    commandBursts.io.enq.bits.scratchpadBlockOffset := (localBase - params.scratchpadAddress.base.U + nextOffset) >> 6
+    commandBursts.io.enq.bits.store := !load
+    advanceOffset := commandBursts.io.enq.fire
     val decoder = Module(new Queue(new ActiveSPMDeSCBurst(params), params.descQueueDepth))
     val firstByte = port.decode.bits.externalAddress
     val lastByte = Cat(port.decode.bits.externalBlockAddress, 63.U(6.W))
@@ -326,16 +342,25 @@ private[activespm] class ActiveSPMConcurrentDMA(
     val decoderSlots = RegInit(0.U(log2Ceil(n + 1).W))
     val free = ~allocated.asUInt
     val preferDecoder = RegInit(false.B)
-    val inferCanAllocate = inference.io.deq.valid && !fatal
+    val commandCanAllocate = commandBursts.io.deq.valid && !fatal
     val decodeCanAllocate = decoder.io.deq.valid && decoderSlots < (n / 2).U && admission.io.decoderEnabled
-    val allocateDecoder = decodeCanAllocate && (!inferCanAllocate || preferDecoder)
-    allocate := !paused && free.orR && (inferCanAllocate || decodeCanAllocate)
+    val allocateDecoder = decodeCanAllocate && (!commandCanAllocate || preferDecoder)
+    allocate := !paused && free.orR && (commandCanAllocate || decodeCanAllocate)
     allocateSlot := PriorityEncoder(free)
-    inference.io.deq.ready := allocate && !allocateDecoder
+    commandBursts.io.deq.ready := allocate && !allocateDecoder
     decoder.io.deq.ready := allocate && allocateDecoder
+    // Shared slot IDs need not follow address order. Record the order of
+    // MMIO-command bursts independently of the decoder's slot lifetime.
+    val commandOrder = Module(new Queue(UInt(indexBits.W), n))
+    commandOrder.io.enq.valid := commandBursts.io.deq.fire
+    commandOrder.io.enq.bits := allocateSlot
+    commandOrder.io.deq.ready := retire && !isDecode(retireSlot)
+    commandHead := commandOrder.io.deq.bits
+    commandHeadValid := commandOrder.io.deq.valid
+    when(commandOrder.io.enq.valid) { assert(commandOrder.io.enq.ready) }
     when(allocate) {
       preferDecoder := !allocateDecoder
-      descriptors.get(allocateSlot) := Mux(allocateDecoder, decoder.io.deq.bits, inference.io.deq.bits)
+      descriptors.get(allocateSlot) := Mux(allocateDecoder, decoder.io.deq.bits, commandBursts.io.deq.bits)
       decodeClass.get(allocateSlot) := allocateDecoder
       failed.get(allocateSlot) := false.B
     }
@@ -381,17 +406,17 @@ private[activespm] class ActiveSPMConcurrentDMA(
     }
 
     val retireReady = (0 until n).map { i =>
-      val locked = (admission.io.locked && issueSlot === i.U) ||
-        localLocked.zipWithIndex.map { case (hold, lane) => hold && localIssueSlot(lane) === i.U }.reduce(_ || _)
-      val localPending = (0 until 2).map(lane => localIssued(lane)(i) && !localDone(lane)(i)).reduce(_ || _)
-      val cancelled = poisoned(i) && !externalPending(i) && !localPending
-      allocated(i) && !locked && (cancelled || (externalDone(i) && localDone.map(_(i)).reduce(_ && _)))
+      val slot = i.U
+      val locked = (admission.io.locked && issueSlot === slot) ||
+        localLocked.zipWithIndex.map { case (hold, lane) => hold && localIssueSlot(lane) === slot }.reduce(_ || _)
+      val canRetireInOrder = isDecode(slot) || (commandHeadValid && commandHead === slot)
+      val cancelled = poisoned(i) && slotDrained(slot)
+      allocated(i) && canRetireInOrder && !locked && (cancelled || slotFinished(slot))
     }
     retire := retireReady.reduce(_ || _)
     retireSlot := nextReady(retireReady, retirePtr)
     quiescent.get := drained && !admission.io.locked && !localLocked.reduce(_ || _)
-    inferenceDrained := !inference.io.deq.valid &&
-      !(0 until n).map(i => allocated(i) && !isDecode(i.U)).reduce(_ || _)
+    commandDrained := !commandBursts.io.deq.valid && !commandHeadValid
   }
 
   when(io.control.request.fire) {
@@ -401,6 +426,7 @@ private[activespm] class ActiveSPMConcurrentDMA(
     length := io.control.request.bits.byteCount
     nextOffset := 0.U
     completed := 0.U
+    prefixBlocked := false.B
     fatal := false.B
     error := ActiveSPMErrorCode.none
     if (!descEnabled) {
@@ -437,6 +463,7 @@ private[activespm] class ActiveSPMConcurrentDMA(
     for (lane <- 0 until 2) {
       localIssued(lane)(allocateSlot) := false.B
       localDone(lane)(allocateSlot) := false.B
+      destinationAcked(lane)(allocateSlot) := false.B
     }
   }
   when(advanceOffset) { nextOffset := nextOffset + 64.U }
@@ -456,6 +483,7 @@ private[activespm] class ActiveSPMConcurrentDMA(
     assert(io.external.d.bits.opcode === Mux(isLoad(slot), TLMessages.AccessAckData, TLMessages.AccessAck))
     externalPending(slot) := false.B
     externalDone(slot) := true.B
+    when(externalWriteAck) { destinationAcked.foreach(_(slot) := true.B) }
     when(isLoad(slot) && !externalBad && !poisoned(slot)) {
       data(0)(slot) := io.external.d.bits.data(255, 0)
       data(1)(slot) := io.external.d.bits.data(511, 256)
@@ -485,21 +513,25 @@ private[activespm] class ActiveSPMConcurrentDMA(
       assert(tl.d.bits.opcode === Mux(isLoad(responseSlot), TLMessages.AccessAck, TLMessages.AccessAckData))
       localBusy(lane)(responseTag) := false.B
       localDone(lane)(responseSlot) := true.B
+      when(localWriteAcks(lane)) { destinationAcked(lane)(responseSlot) := true.B }
       when(!isLoad(responseSlot) && !localBad(lane) && !poisoned(responseSlot)) {
         data(lane)(responseSlot) := tl.d.bits.data
       }
     }
   }
   when(state === active) {
-    completed := completed + inferenceBytes
-    when(inferenceBad) { fatal := true.B; error := ActiveSPMErrorCode.tileLink }
-    when(fatal && (if (descEnabled) inferenceDrained else drained)) { state := complete }
-    when(!fatal && nextOffset === length && inferenceDrained) {
+    when(retire && !isDecode(retireSlot)) {
+      completed := completedWithHead
+      when(headBytes =/= 64.U) { prefixBlocked := true.B }
+    }
+    when(commandFailed) { fatal := true.B; error := ActiveSPMErrorCode.tileLink }
+    when(fatal && commandDrained) { state := complete }
+    when(!fatal && nextOffset === length && commandDrained) {
       assert(completed === length, "Concurrent DMA completed before every destination acknowledgment")
       state := complete
     }
     assert(occupancy <= n.U)
-    assert(completed <= length)
+    assert(completedWithHead <= length)
   }
   when(io.control.completion.fire) { state := idle }
 }
