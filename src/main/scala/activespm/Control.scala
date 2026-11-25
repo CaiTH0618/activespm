@@ -18,7 +18,7 @@ import org.chipsalliance.diplomacy.lazymodule.{LazyModule, LazyModuleImp}
   */
 class ActiveSPMControl(params: ActiveSPMParams)(implicit p: Parameters) extends LazyModule {
   // DTS node names cannot contain the brackets required by the NoC mapping key.
-  private val device = new SimpleDevice(s"activespm-ctrl-${params.id}", Seq("caitianhao,activespm-control"))
+  private val device = new SimpleDevice(s"activespm-ctrl-${params.id}", Seq("activespm-control"))
 
   private val registerNode = TLRegisterNode(
     address = Seq(params.controlAddress),
